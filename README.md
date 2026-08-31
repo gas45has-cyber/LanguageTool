@@ -7,7 +7,7 @@
 ### 📥 Скачать архив
 
 * **[Скачать архив с Google Диска](https://drive.google.com/file/d/1wGGTuxbUx-Buc6laYtSvPikRtDQzkPuP/view?usp=drive_link)**
-* Или скачайте файл из Telegram / раздела Releases на GitHub.
+
 
 ---
 
