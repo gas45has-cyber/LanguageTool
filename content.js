@@ -6,7 +6,10 @@
   let currentRequestId = 0;
   let isInteractingWithPopup = false;
 
-  // Создаем изолированный контейнер Shadow DOM
+  const LT_API_URL = 'https://api.languagetool.org/v2/check';
+  const YANDEX_API_URL = 'https://speller.yandex.net/services/spellservice.json/checkText';
+  const API_TIMEOUT_MS = 6000;
+
   const host = document.createElement('div');
   host.id = 'lt-clone-root';
   document.documentElement.appendChild(host);
@@ -186,20 +189,13 @@
 
   function isValidTarget(el) {
     if (!el || el.disabled || el.readOnly) return false;
-    
-    // Поддержка редакторов текста и contenteditable блоков
     if (el.isContentEditable) return true;
-    
-    // Поддержка любых текстовых областей
     if (el.tagName === 'TEXTAREA') return true;
-    
-    // Поддержка всех типов текстовых инпутов (включая search, email, url, tel)
     if (el.tagName === 'INPUT') {
       const type = (el.type || 'text').toLowerCase();
       const textInputTypes = ['text', 'search', 'email', 'url', 'tel', ''];
       return textInputTypes.includes(type);
     }
-    
     return false;
   }
 
@@ -294,10 +290,8 @@
     activeElement.focus();
 
     if ('setSelectionRange' in activeElement && typeof activeElement.selectionStart === 'number') {
-      // Обычные поля ввода (textarea, input)
       activeElement.setSelectionRange(offset, offset + length);
       const success = document.execCommand('insertText', false, newText);
-      
       const newCursorPos = offset + newText.length;
       if (!success) {
         const full = activeElement.value || '';
@@ -306,7 +300,6 @@
       }
       activeElement.setSelectionRange(newCursorPos, newCursorPos);
     } else if (activeElement.isContentEditable) {
-      // Редакторы сообщений в мессенджерах (contenteditable)
       const range = setContentEditableRange(activeElement, offset, offset + length);
       let replaced = false;
 
@@ -320,7 +313,6 @@
           const newNode = document.createTextNode(newText);
           range.insertNode(newNode);
 
-          // Ставим курсор сразу после вставленного текста
           const sel = window.getSelection();
           const newRange = document.createRange();
           newRange.setStartAfter(newNode);
@@ -335,7 +327,7 @@
       }
     }
 
-    hidePopups();
+    tooltip.style.display = 'none';
     runCheck(activeElement);
   }
 
@@ -460,12 +452,18 @@
       overlay.innerHTML = '';
       badge.textContent = '✓';
       badge.classList.remove('has-errors');
-      hidePopups();
+      if (panel.style.display === 'block') {
+        showAllErrorsPanel(badge.getBoundingClientRect());
+      }
       return;
     }
 
     badge.textContent = errors.length;
     badge.classList.add('has-errors');
+
+    if (panel.style.display === 'block') {
+      showAllErrorsPanel(badge.getBoundingClientRect());
+    }
 
     let html = '';
     let lastIdx = 0;
@@ -508,6 +506,87 @@
     return -1;
   }
 
+  async function fetchWithTiming(url, options, name) {
+    const start = performance.now();
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(API_TIMEOUT_MS)
+      });
+      const timeMs = Math.round(performance.now() - start);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      return { ok: true, data, timeMs, name };
+    } catch (e) {
+      const timeMs = Math.round(performance.now() - start);
+      return { ok: false, error: e, timeMs, name };
+    }
+  }
+
+  function normalizeLTMatches(data, text) {
+    const formatted = [];
+    (data.matches || []).forEach(m => {
+      const isHugeStylisticRule = (!m.replacements || m.replacements.length === 0) && m.length > 25;
+      if (isHugeStylisticRule) return;
+
+      let replacements = (m.replacements || []).map(r => r.value);
+      const snippet = text.slice(m.offset, m.offset + m.length);
+
+      if (replacements.length === 0 && /[а-яё]\s+[А-ЯЁ]/.test(snippet)) {
+        const parts = snippet.split(/\s+/);
+        if (parts.length >= 2) {
+          replacements = [
+            `${parts[0]}. ${parts[1]}`,
+            `${parts[0]}, ${parts[1].toLowerCase()}`
+          ];
+        }
+      } else if (replacements.length === 0 && /^[А-ЯЁ][а-яё]+$/.test(snippet)) {
+        replacements = [`. ${snippet}`, snippet.toLowerCase()];
+      }
+
+      formatted.push({
+        offset: m.offset,
+        length: m.length,
+        message: m.message,
+        replacements: replacements,
+        type: m.rule?.issueType === 'misspelling' ? 'spelling' : 'grammar',
+        source: 'LanguageTool'
+      });
+    });
+    return formatted;
+  }
+
+  function normalizeYandexMatches(data) {
+    if (!Array.isArray(data)) return [];
+    return data.map(m => ({
+      offset: m.pos,
+      length: m.len,
+      message: 'Возможна орфографическая ошибка (Яндекс)',
+      replacements: m.s || [],
+      type: 'spelling',
+      source: 'Yandex'
+    }));
+  }
+
+  function mergeEngineErrors(ltErrors, yandexErrors) {
+    const merged = [...ltErrors];
+    for (const ye of yandexErrors) {
+      const match = merged.find(le => {
+        const aStart = le.offset, aEnd = le.offset + le.length;
+        const bStart = ye.offset, bEnd = ye.offset + ye.length;
+        return aStart < bEnd && bStart < aEnd;
+      });
+
+      if (!match) {
+        merged.push(ye);
+      } else {
+        const combined = [...(match.replacements || []), ...(ye.replacements || [])];
+        match.replacements = [...new Set(combined)].slice(0, 6);
+      }
+    }
+    return merged;
+  }
+
   async function runCheck(target) {
     if (!isValidTarget(target)) return;
     const text = getCleanText(target);
@@ -522,98 +601,87 @@
     const isRussian = /[а-яёА-ЯЁ]/.test(text);
     const langCode = isRussian ? 'ru-RU' : 'en-US';
 
-    try {
-      const params = new URLSearchParams();
-      params.append('text', text);
-      params.append('language', langCode);
-      params.append('level', 'picky');
-      params.append('enabledCategories', 'PUNCTUATION,TYPOGRAPHY,GRAMMAR,MISC');
+    const ltParams = new URLSearchParams();
+    ltParams.append('text', text);
+    ltParams.append('language', langCode);
+    ltParams.append('level', 'picky');
+    ltParams.append('enabledCategories', 'PUNCTUATION,TYPOGRAPHY,GRAMMAR,MISC');
 
-      const res = await fetch('https://api.languagetool.org/v2/check', {
+    const yandexParams = new URLSearchParams();
+    yandexParams.append('text', text);
+    yandexParams.append('lang', isRussian ? 'ru' : 'en');
+    yandexParams.append('options', '0');
+    yandexParams.append('format', 'plain');
+
+    const totalStart = performance.now();
+
+    const [ltRes, yandexRes] = await Promise.allSettled([
+      fetchWithTiming(LT_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params
-      });
+        body: ltParams
+      }, 'LanguageTool'),
 
-      if (res.ok) {
-        if (requestId !== currentRequestId) return;
+      fetchWithTiming(YANDEX_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: yandexParams
+      }, 'Yandex Speller')
+    ]);
 
-        const currentVal = getCleanText(target);
-        if (currentVal.trim().length < 2) {
-          clearAllState();
-          return;
-        }
+    if (requestId !== currentRequestId) return;
+    const currentVal = getCleanText(target);
+    if (currentVal.trim().length < 2) {
+      clearAllState();
+      return;
+    }
 
-        const data = await res.json();
-        if (requestId !== currentRequestId) return;
+    const ltData = ltRes.status === 'fulfilled' ? ltRes.value : { ok: false, timeMs: 0 };
+    const yandexData = yandexRes.status === 'fulfilled' ? yandexRes.value : { ok: false, timeMs: 0 };
+    const totalTimeMs = Math.round(performance.now() - totalStart);
 
-        let formattedErrors = [];
+    console.log(
+      `⏱ [Rometto LT] ИТОГО: ${totalTimeMs} ms | ` +
+      `LanguageTool: ${ltData.timeMs} ms (${ltData.ok ? 'OK' : 'ERR'}) | ` +
+      `Yandex Speller: ${yandexData.timeMs} ms (${yandexData.ok ? 'OK' : 'ERR'})`
+    );
 
-        (data.matches || []).forEach(m => {
-          const isHugeStylisticRule = (!m.replacements || m.replacements.length === 0) && m.length > 25;
-          if (isHugeStylisticRule) return;
+    const ltErrors = ltData.ok ? normalizeLTMatches(ltData.data, text) : [];
+    const yErrors = yandexData.ok ? normalizeYandexMatches(yandexData.data) : [];
 
-          let replacements = (m.replacements || []).map(r => r.value);
-          const snippet = text.slice(m.offset, m.offset + m.length);
+    let formattedErrors = mergeEngineErrors(ltErrors, yErrors);
 
-          if (replacements.length === 0 && /[а-яё]\s+[А-ЯЁ]/.test(snippet)) {
-            const parts = snippet.split(/\s+/);
-            if (parts.length >= 2) {
-              replacements = [
-                `${parts[0]}. ${parts[1]}`,
-                `${parts[0]}, ${parts[1].toLowerCase()}`
-              ];
-            }
-          } else if (replacements.length === 0 && /^[А-ЯЁ][а-яё]+$/.test(snippet)) {
-            replacements = [
-              `. ${snippet}`,
-              snippet.toLowerCase()
-            ];
-          }
+    // Детектор обращений (Имя + приветствие)
+    if (isRussian) {
+      const greetingRegex = /\b([А-ЯЁ][а-яё]+)\s+(здравствуй[тте]*|привет|добрый\s+день|доброе\s+утро|добрый\s+вечер)\b/gui;
+      let match;
+      while ((match = greetingRegex.exec(text)) !== null) {
+        const name = match[1];
+        const hasComma = text.slice(match.index, match.index + match[0].length).includes(',');
+
+        if (!hasComma) {
+          const offset = match.index;
+          const length = match[0].length;
+
+          formattedErrors = formattedErrors.filter(e => !(e.offset >= offset && e.offset + e.length <= offset + length));
 
           formattedErrors.push({
-            offset: m.offset,
-            length: m.length,
-            message: m.message,
-            replacements: replacements,
-            type: m.rule?.issueType === 'misspelling' ? 'spelling' : 'grammar'
+            offset: offset,
+            length: length,
+            message: `После обращения «${name}» пропущена запятая.`,
+            replacements: [
+              `${name}, здравствуйте`,
+              `${name}, здравствуй`,
+              `${name}, добрый день`
+            ],
+            type: 'grammar',
+            source: 'Rometto Detector'
           });
-        });
-
-        // Детектор обращений (Имя + приветствие)
-        if (isRussian) {
-          const greetingRegex = /\b([А-ЯЁ][а-яё]+)\s+(здравствуй[тте]*|привет|добрый\s+день|доброе\s+утро|добрый\s+вечер)\b/gui;
-          let match;
-          while ((match = greetingRegex.exec(text)) !== null) {
-            const name = match[1];
-            const hasComma = text.slice(match.index, match.index + match[0].length).includes(',');
-
-            if (!hasComma) {
-              const offset = match.index;
-              const length = match[0].length;
-
-              formattedErrors = formattedErrors.filter(e => !(e.offset >= offset && e.offset + e.length <= offset + length));
-
-              formattedErrors.push({
-                offset: offset,
-                length: length,
-                message: `После обращения «${name}» пропущена запятая.`,
-                replacements: [
-                  `${name}, здравствуйте`,
-                  `${name}, здравствуй`,
-                  `${name}, добрый день`
-                ],
-                type: 'grammar'
-              });
-            }
-          }
         }
-
-        renderHighlights(text, formattedErrors);
       }
-    } catch (e) {
-      console.error('Ошибка проверки:', e);
     }
+
+    renderHighlights(text, formattedErrors);
   }
 
   function handleInputEvent(e) {
@@ -625,7 +693,7 @@
     }
     activeElement = e.target;
     if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => runCheck(e.target), 400);
+    debounceTimer = setTimeout(() => runCheck(e.target), 350);
   }
 
   document.addEventListener('input', handleInputEvent);
@@ -666,13 +734,11 @@
     }
   });
 
-  // Клик по тексту определяет попадание в ошибку без блокировки курсора
   document.addEventListener('click', (e) => {
     if (isInteractingWithPopup) return;
 
     if (e.target !== host && !host.contains(e.target)) {
       if (isValidTarget(e.target) && currentErrors.length > 0) {
-        // Небольшая задержка, чтобы браузер успел поставить нативный курсор
         setTimeout(() => {
           const offset = getCaretOffset(e.target, e.clientX, e.clientY);
           if (offset >= 0) {
