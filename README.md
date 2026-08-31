@@ -7,7 +7,8 @@
 ### 📥 Скачать архив
 
 * **[Скачать архив с Google Диска](https://drive.google.com/file/d/1wGGTuxbUx-Buc6laYtSvPikRtDQzkPuP/view?usp=drive_link)**
-
+*
+* Или нажмите зеленую кнопку **Code** вверху страницы $\rightarrow$ **Download ZIP**.
 
 ---
 
