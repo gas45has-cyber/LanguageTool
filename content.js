@@ -249,18 +249,92 @@
     panel.style.display = 'none';
   }
 
+  function getTextNodesUnder(el) {
+    const textNodes = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    let n;
+    while ((n = walk.nextNode())) textNodes.push(n);
+    return textNodes;
+  }
+
+  function setContentEditableRange(el, start, end) {
+    const textNodes = getTextNodesUnder(el);
+    let currentOffset = 0;
+    let startNode = null, startNodeOffset = 0;
+    let endNode = null, endNodeOffset = 0;
+
+    for (const node of textNodes) {
+      const nodeLen = node.textContent.length;
+      if (!startNode && currentOffset + nodeLen >= start) {
+        startNode = node;
+        startNodeOffset = Math.max(0, start - currentOffset);
+      }
+      if (!endNode && currentOffset + nodeLen >= end) {
+        endNode = node;
+        endNodeOffset = Math.min(nodeLen, end - currentOffset);
+        break;
+      }
+      currentOffset += nodeLen;
+    }
+
+    if (startNode && endNode) {
+      const range = document.createRange();
+      range.setStart(startNode, startNodeOffset);
+      range.setEnd(endNode, endNodeOffset);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return range;
+    }
+    return null;
+  }
+
   function replaceText(offset, length, newText) {
     if (!activeElement) return;
     activeElement.focus();
 
-    if ('setSelectionRange' in activeElement) {
+    if ('setSelectionRange' in activeElement && typeof activeElement.selectionStart === 'number') {
+      // Обычные поля ввода (textarea, input)
       activeElement.setSelectionRange(offset, offset + length);
-      document.execCommand('insertText', false, newText);
+      const success = document.execCommand('insertText', false, newText);
+      
+      const newCursorPos = offset + newText.length;
+      if (!success) {
+        const full = activeElement.value || '';
+        activeElement.value = full.slice(0, offset) + newText + full.slice(offset + length);
+        activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      activeElement.setSelectionRange(newCursorPos, newCursorPos);
     } else if (activeElement.isContentEditable) {
-      const full = getCleanText(activeElement);
-      activeElement.innerText = full.slice(0, offset) + newText + full.slice(offset + length);
-      activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+      // Редакторы сообщений в мессенджерах (contenteditable)
+      const range = setContentEditableRange(activeElement, offset, offset + length);
+      let replaced = false;
+
+      if (range) {
+        replaced = document.execCommand('insertText', false, newText);
+      }
+
+      if (!replaced) {
+        if (range) {
+          range.deleteContents();
+          const newNode = document.createTextNode(newText);
+          range.insertNode(newNode);
+
+          // Ставим курсор сразу после вставленного текста
+          const sel = window.getSelection();
+          const newRange = document.createRange();
+          newRange.setStartAfter(newNode);
+          newRange.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(newRange);
+        } else {
+          const full = getCleanText(activeElement);
+          activeElement.innerText = full.slice(0, offset) + newText + full.slice(offset + length);
+        }
+        activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+      }
     }
+
     hidePopups();
     runCheck(activeElement);
   }
